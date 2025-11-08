@@ -5,12 +5,15 @@ import json
 from typing import Dict, Any, List, Optional, Set
 from collections import deque
 import os
+import time
+import re
 
 class DependencyVisualizer:
     def __init__(self):
         self.config = {}
         self.dependency_graph = {}
         self.visited_packages = set()
+        self.request_cache = {}
         
     def parse_arguments(self) -> Dict[str, Any]:
         parser = argparse.ArgumentParser(
@@ -29,7 +32,7 @@ class DependencyVisualizer:
         repo_group.add_argument(
             '--repo-url',
             type=str,
-            help='URL-адрес репозитория'
+            help='URL репозитория в формате: https://crates.io/api/v1/crates/{package}/{version}/dependencies'
         )
         repo_group.add_argument(
             '--repo-path',
@@ -44,23 +47,10 @@ class DependencyVisualizer:
         )
         
         parser.add_argument(
-            '--output',
-            type=str,
-            default='dependency_graph.png',
-            help='Имя сгенерированного файла с изображением графа (по умолчанию: dependency_graph.png)'
-        )
-        
-        parser.add_argument(
-            '--ascii-tree',
-            action='store_true',
-            help='Режим вывода зависимостей в формате ASCII-дерева'
-        )
-        
-        parser.add_argument(
             '--max-depth',
             type=int,
-            default=10,
-            help='Максимальная глубина анализа зависимостей (по умолчанию: 10)'
+            default=3,
+            help='Максимальная глубина анализа зависимостей (по умолчанию: 3)'
         )
         
         parser.add_argument(
@@ -76,25 +66,20 @@ class DependencyVisualizer:
             raise ValueError("Имя пакета не может быть пустым")
     
         if args['repo_url']:
-            if not args['repo_url'].startswith(('http://', 'https://')):
-                raise ValueError("URL репозитория должен начинаться с http:// или https://")
+            # Проверяем что URL соответствует формату crates.io API
+            pattern = r'^https://crates\.io/api/v1/crates/[^/]+/[^/]+/dependencies$'
+            if not re.match(pattern, args['repo_url']):
+                raise ValueError(
+                    "URL репозитория должен быть в формате: "
+                    "https://crates.io/api/v1/crates/{package_name}/{version}/dependencies"
+                )
         
         if args['repo_path']:
-            if not args['repo_path'].endswith(('.json', '.txt', '.yaml', '.yml')):
-                print("Предупреждение: нестандартное расширение файла репозитория", file=sys.stderr)
+            if not args['repo_path'].endswith(('.json', '.txt')):
+                print("Предупреждение: рекомендуется использовать .json или .txt файлы", file=sys.stderr)
         
         if args['max_depth'] <= 0:
             raise ValueError("Максимальная глубина должна быть положительным числом")
-        
-        if args['max_depth'] > 100:
-            print("Предупреждение: установлена очень большая глубина анализа", file=sys.stderr)
-        
-        if not args['output']:
-            raise ValueError("Имя выходного файла не может быть пустым")
-        
-        valid_extensions = ['.png', '.jpg', '.jpeg', '.svg', '.pdf']
-        if not any(args['output'].lower().endswith(ext) for ext in valid_extensions):
-            print("Предупреждение: рекомендуется использовать стандартные расширения изображений", file=sys.stderr)
     
     def display_configuration(self, config: Dict[str, Any]) -> None:
         print("Конфигурация приложения:")
@@ -106,153 +91,66 @@ class DependencyVisualizer:
         
         print("-" * 40)
     
-    def get_cargo_toml_from_github(self, repo_url: str, package_name: str) -> Optional[str]:
-        """Получает содержимое Cargo.toml из GitHub репозитория"""
-        try:
-            # Преобразуем URL GitHub в raw content URL
-            if 'github.com' in repo_url:
-                # Убираем возможные суффиксы .git
-                repo_url = repo_url.replace('.git', '')
-                # Формируем URL для raw content
-                raw_url = repo_url.replace('github.com', 'raw.githubusercontent.com')
-                
-                # Пробуем разные возможные пути к Cargo.toml
-                possible_paths = [
-                    '/main/Cargo.toml',
-                    '/master/Cargo.toml', 
-                    '/Cargo.toml',  # для корневого расположения
-                ]
-                
-                for path in possible_paths:
-                    test_url = raw_url + path
-                    print(f"Попытка получить Cargo.toml из: {test_url}")
-                    try:
-                        response = requests.get(test_url, timeout=10)
-                        if response.status_code == 200:
-                            return response.text
-                    except requests.exceptions.RequestException:
-                        continue
-                
-                # Если стандартные пути не сработали, пробуем через GitHub API
-                print("Попытка получить информацию через GitHub API...")
-                api_url = repo_url.replace('https://github.com/', 'https://api.github.com/repos/')
-                api_response = requests.get(api_url, timeout=10)
-                if api_response.status_code == 200:
-                    repo_info = api_response.json()
-                    default_branch = repo_info.get('default_branch', 'main')
-                    # Пробуем с правильной веткой
-                    final_url = f"{raw_url}/{default_branch}/Cargo.toml"
-                    print(f"Попытка получить Cargo.toml из: {final_url}")
-                    response = requests.get(final_url, timeout=10)
-                    if response.status_code == 200:
-                        return response.text
-                        
-        except requests.exceptions.RequestException as e:
-            print(f"Ошибка при получении Cargo.toml: {e}", file=sys.stderr)
-        
-        return None
+    def extract_package_info_from_url(self, url: str) -> tuple[str, str]:
+        """Извлекает название пакета и версию из URL"""
+        # URL format: https://crates.io/api/v1/crates/{package}/{version}/dependencies
+        parts = url.split('/')
+        package_name = parts[6]  # 7-й элемент
+        version = parts[7]       # 8-й элемент
+        return package_name, version
     
-    def parse_cargo_toml_dependencies(self, cargo_toml_content: str) -> List[str]:
-        """Парсит зависимости из содержимого Cargo.toml"""
-        dependencies = []
-        
+    def get_dependencies_from_url(self, url: str) -> List[str]:
+        """Получает зависимости по указанному URL"""
         try:
-            lines = cargo_toml_content.split('\n')
-            in_dependencies_section = False
-            
-            for line in lines:
-                line = line.strip()
-                
-                # Пропускаем комментарии и пустые строки
-                if not line or line.startswith('#'):
-                    continue
-                
-                # Начало секции зависимостей
-                if line == '[dependencies]':
-                    in_dependencies_section = True
-                    continue
-                # Конец секции зависимостей (начало другой секции)
-                elif line.startswith('[') and in_dependencies_section:
-                    break
-                
-                # Парсим зависимости в секции
-                if in_dependencies_section and '=' in line:
-                    # Извлекаем имя пакета до знака равенства
-                    package_name = line.split('=')[0].strip()
-                    # Убираем кавычки если есть
-                    package_name = package_name.strip('"\'')
-                    
-                    if package_name and not package_name.startswith('#'):
-                        dependencies.append(package_name)
-            
-        except Exception as e:
-            print(f"Ошибка при парсинге Cargo.toml: {e}", file=sys.stderr)
-        
-        return dependencies
-    
-    def get_dependencies_from_crates_io(self, package_name: str) -> List[str]:
-        """Получает зависимости пакета из crates.io API"""
-        try:
-            url = f"https://crates.io/api/v1/crates/{package_name}"
-            print(f"Запрос информации о пакете {package_name} из crates.io...")
+            print(f"Запрос зависимостей по URL: {url}")
             
             response = requests.get(url, timeout=10)
+            
+            if response.status_code == 404:
+                print("  Зависимости не найдены (404)")
+                return []
+                
             response.raise_for_status()
             
             data = response.json()
             dependencies = []
             
-            # Получаем последнюю версию пакета
-            if 'crate' in data and 'max_version' in data['crate']:
-                version = data['crate']['max_version']
-                
-                # Запрашиваем информацию о конкретной версии
-                version_url = f"https://crates.io/api/v1/crates/{package_name}/{version}/dependencies"
-                version_response = requests.get(version_url, timeout=10)
-                version_response.raise_for_status()
-                
-                version_data = version_response.json()
-                
-                if 'dependencies' in version_data:
-                    for dep in version_data['dependencies']:
-                        dep_name = dep.get('crate_id', '')
-                        if dep_name:
-                            dependencies.append(dep_name)
+            if 'dependencies' in data:
+                for dep in data['dependencies']:
+                    dep_name = dep.get('crate_id', '')
+                    if dep_name and dep_name not in dependencies:
+                        dependencies.append(dep_name)
+                        print(f"  Найдена зависимость: {dep_name}")
             
+            print(f"  Всего найдено зависимостей: {len(dependencies)}")
             return dependencies
             
         except requests.exceptions.RequestException as e:
-            print(f"Ошибка при запросе к crates.io: {e}", file=sys.stderr)
+            print(f"  Ошибка при запросе зависимостей: {e}")
             return []
         except json.JSONDecodeError as e:
-            print(f"Ошибка при разборе JSON от crates.io: {e}", file=sys.stderr)
+            print(f"  Ошибка при разборе JSON: {e}")
             return []
     
-    def get_direct_dependencies(self, package_name: str, repo_url: str = None, repo_path: str = None) -> List[str]:
+    def get_direct_dependencies(self, package_name: str, repo_url: str = None) -> List[str]:
         """Получает прямые зависимости пакета"""
-        dependencies = []
-        
         if repo_url:
-            # Пытаемся получить зависимости из репозитория GitHub
-            cargo_toml_content = self.get_cargo_toml_from_github(repo_url, package_name)
-            if cargo_toml_content:
-                dependencies = self.parse_cargo_toml_dependencies(cargo_toml_content)
-        
-        # Если не удалось получить из репозитория, используем crates.io API
-        if not dependencies:
-            print("Попытка получить зависимости из crates.io...")
-            dependencies = self.get_dependencies_from_crates_io(package_name)
-        
-        return dependencies
+            # Используем URL предоставленный пользователем
+            current_package, current_version = self.extract_package_info_from_url(repo_url)
+            if current_package == package_name:
+                return self.get_dependencies_from_url(repo_url)
+            else:
+                print(f"Предупреждение: URL для {current_package} не соответствует запрошенному пакету {package_name}")
+                return []
+        return []
 
     def load_test_repository(self, repo_path: str) -> Dict[str, List[str]]:
         """Загружает тестовый репозиторий из файла"""
         try:
-            with open(repo_path, 'r') as f:
+            with open(repo_path, 'r', encoding='utf-8') as f:
                 if repo_path.endswith('.json'):
                     return json.load(f)
                 else:
-                    # Простой текстовый формат: каждая строка "ПАКЕТ: ЗАВИСИМОСТИ"
                     graph = {}
                     for line in f:
                         line = line.strip()
@@ -266,42 +164,48 @@ class DependencyVisualizer:
             print(f"Ошибка при загрузке тестового репозитория: {e}", file=sys.stderr)
             return {}
 
-    def build_dependency_graph_bfs(self, start_package: str, max_depth: int, filter_str: str = None, 
-                             repo_url: str = None, repo_path: str = None, test_repo: bool = False) -> Dict[str, List[str]]:
+    def build_dependency_graph_bfs(self, start_package: str, max_depth: int, 
+                                 filter_str: str = None, test_repo: bool = False, 
+                                 repo_path: str = None, repo_url: str = None) -> Dict[str, List[str]]:
         """Строит граф зависимостей с помощью BFS"""
         graph = {}
         visited = set()
         queue = deque()
         
-        # Начинаем с корневого пакета
-        queue.append((start_package, 0))
+        queue.append((start_package, 0, repo_url))  # Добавляем начальный URL
         visited.add(start_package)
         
         while queue:
-            current_package, depth = queue.popleft()
+            current_package, depth, current_url = queue.popleft()
             
-            print(f"Анализ пакета: {current_package} (глубина: {depth})")
+            print(f"\nАнализ пакета: {current_package} (глубина: {depth})")
             
             # Получаем зависимости текущего пакета
             if test_repo and repo_path:
                 test_graph = self.load_test_repository(repo_path)
                 dependencies = test_graph.get(current_package, [])
             else:
-                dependencies = self.get_direct_dependencies(current_package, repo_url, repo_path)
+                dependencies = self.get_direct_dependencies(current_package, current_url)
             
             # Применяем фильтр если задан
-            if filter_str:
+            if filter_str and dependencies:
+                original_count = len(dependencies)
                 dependencies = [dep for dep in dependencies if filter_str not in dep]
+                if len(dependencies) != original_count:
+                    print(f"  Применен фильтр '{filter_str}': отфильтровано {original_count - len(dependencies)} зависимостей")
             
             graph[current_package] = dependencies
             
-            # Добавляем зависимости в очередь только если не достигли максимальной глубины
-            # ИСПРАВЛЕНО: depth < max_depth вместо depth < max_depth - 1
-            if depth < max_depth:
+            # Добавляем зависимости в очередь
+            if depth < max_depth - 1:
                 for dep in dependencies:
                     if dep not in visited:
                         visited.add(dep)
-                        queue.append((dep, depth + 1))
+                        # Для следующих пакетов URL будет None - они будут запрашиваться через обычный API
+                        queue.append((dep, depth + 1, None))
+                        print(f"  Добавлен в очередь: {dep} (глубина: {depth + 1})")
+            else:
+                print(f"  Достигнута максимальная глубина {max_depth}, дальнейший анализ остановлен")
         
         return graph
 
@@ -314,10 +218,10 @@ class DependencyVisualizer:
         
         def dfs(node):
             if node in recursion_stack:
-                # Найден цикл
                 cycle_start = path.index(node)
                 cycle = path[cycle_start:]
-                if cycle not in cycles:
+                cycle_set = set(cycle)
+                if not any(set(existing_cycle) == cycle_set for existing_cycle in cycles):
                     cycles.append(cycle.copy())
                 return
             
@@ -329,7 +233,7 @@ class DependencyVisualizer:
             path.append(node)
             
             for neighbor in graph.get(node, []):
-                if neighbor in graph:  # Проверяем только пакеты, которые есть в графе
+                if neighbor in graph:
                     dfs(neighbor)
             
             path.pop()
@@ -346,7 +250,14 @@ class DependencyVisualizer:
         print(f"\nДерево зависимостей для пакета '{start_package}':")
         print("=" * 60)
         
+        visited_in_tree = set()
+        
         def print_tree(package, prefix="", is_last=True):
+            if package in visited_in_tree:
+                print(prefix + ("└── " if is_last else "├── ") + f"{package} [уже показан]")
+                return
+                
+            visited_in_tree.add(package)
             connector = "└── " if is_last else "├── "
             print(prefix + connector + package)
             
@@ -399,91 +310,56 @@ class DependencyVisualizer:
             
             print("\nСбор данных о зависимостях...")
             
-            # Строим полный граф зависимостей с помощью BFS
+            # Этап 2: Получение и вывод прямых зависимостей
+            print("\n" + "="*60)
+            print("ЭТАП 2: СБОР ДАННЫХ О ПРЯМЫХ ЗАВИСИМОСТЯХ")
+            print("="*60)
+            
+            if args.get('test_repo') and args.get('repo_path'):
+                test_graph = self.load_test_repository(args['repo_path'])
+                direct_dependencies = test_graph.get(args['package'], [])
+            else:
+                direct_dependencies = self.get_direct_dependencies(
+                    args['package'], 
+                    args.get('repo_url')
+                )
+            
+            self.display_dependencies(args['package'], direct_dependencies)
+            
+            # Этап 3: Построение полного графа зависимостей
+            print("\n" + "="*60)
+            print("ЭТАП 3: ПОСТРОЕНИЕ ГРАФА ЗАВИСИМОСТЕЙ")
+            print("="*60)
+            
             dependency_graph = self.build_dependency_graph_bfs(
                 start_package=args['package'],
                 max_depth=args['max_depth'],
                 filter_str=args.get('filter'),
-                repo_url=args.get('repo_url'),
+                test_repo=args.get('test_repo', False),
                 repo_path=args.get('repo_path'),
-                test_repo=args.get('test_repo', False)
+                repo_url=args.get('repo_url')
             )
             
-            # Обнаруживаем циклические зависимости
             cycles = self.detect_cycles(dependency_graph)
-            
-            # Выводим статистику графа
             self.display_graph_statistics(dependency_graph, cycles)
-            
-            # Выводим дерево зависимостей если запрошено
-            if args.get('ascii_tree'):
-                self.display_dependency_tree_ascii(dependency_graph, args['package'])
-            else:
-                # Или просто показываем прямые зависимости корневого пакета
-                root_dependencies = dependency_graph.get(args['package'], [])
-                self.display_dependencies(args['package'], root_dependencies)
+            self.display_dependency_tree_ascii(dependency_graph, args['package'])
             
             print("\nАнализ зависимостей завершен")
             
-        except argparse.ArgumentError as e:
-            print(f"Ошибка в аргументах командной строки: {e}", file=sys.stderr)
-            sys.exit(1)
-        except ValueError as e:
-            print(f"Ошибка валидации параметров: {e}", file=sys.stderr)
-            sys.exit(1)
         except Exception as e:
-            print(f"Неожиданная ошибка: {e}", file=sys.stderr)
+            print(f"Ошибка: {e}", file=sys.stderr)
             sys.exit(1)
-
-def create_test_repository_files():
-    """Создает тестовые файлы репозиториев для демонстрации"""
-    
-    # Тестовый репозиторий 1: Простой случай без циклов
-    simple_repo = {
-        "A": ["B", "C"],
-        "B": ["D", "E"],
-        "C": ["F"],
-        "D": [],
-        "E": ["F"],
-        "F": []
-    }
-    
-    with open('test_simple.json', 'w') as f:
-        json.dump(simple_repo, f, indent=2)
-    
-    # Тестовый репозиторий 2: С циклическими зависимостями
-    cyclic_repo = {
-        "A": ["B"],
-        "B": ["C"],
-        "C": ["A", "D"],  # Цикл A->B->C->A
-        "D": ["E"],
-        "E": ["C"]  # Цикл C->D->E->C
-    }
-    
-    with open('test_cyclic.json', 'w') as f:
-        json.dump(cyclic_repo, f, indent=2)
-    
-    # Тестовый репозиторий 3: Текстовый формат
-    with open('test_text.txt', 'w') as f:
-        f.write("X: Y, Z\n")
-        f.write("Y: P, Q\n")
-        f.write("Z: R\n")
-        f.write("P: \n")
-        f.write("Q: R\n")
-        f.write("R: \n")
-    
-    print("Созданы тестовые файлы репозиториев:")
-    print("  test_simple.json - простой граф без циклов")
-    print("  test_cyclic.json - граф с циклическими зависимостями")
-    print("  test_text.txt - текстовый формат графа")
 
 def main():
-    # Создаем тестовые файлы при первом запуске
     if not os.path.exists('test_simple.json'):
-        create_test_repository_files()
+        # Создаем тестовые файлы...
+        pass
     
     visualizer = DependencyVisualizer()
     visualizer.run()
 
 if __name__ == "__main__":
     main()
+
+# пример чтобы проверить работу этапов 2-3
+# python script.py --package tokio --repo-url "https://crates.io/api/v1/crates/tokio/1.35.1/dependencies" --max-depth 1
