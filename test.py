@@ -2,11 +2,15 @@ import argparse
 import sys
 import requests
 import json
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Set
+from collections import deque
+import os
 
 class DependencyVisualizer:
     def __init__(self):
         self.config = {}
+        self.dependency_graph = {}
+        self.visited_packages = set()
         
     def parse_arguments(self) -> Dict[str, Any]:
         parser = argparse.ArgumentParser(
@@ -240,7 +244,122 @@ class DependencyVisualizer:
             dependencies = self.get_dependencies_from_crates_io(package_name)
         
         return dependencies
-    
+
+    def load_test_repository(self, repo_path: str) -> Dict[str, List[str]]:
+        """Загружает тестовый репозиторий из файла"""
+        try:
+            with open(repo_path, 'r') as f:
+                if repo_path.endswith('.json'):
+                    return json.load(f)
+                else:
+                    # Простой текстовый формат: каждая строка "ПАКЕТ: ЗАВИСИМОСТИ"
+                    graph = {}
+                    for line in f:
+                        line = line.strip()
+                        if line and ':' in line:
+                            package, deps_str = line.split(':', 1)
+                            package = package.strip()
+                            dependencies = [dep.strip() for dep in deps_str.split(',') if dep.strip()]
+                            graph[package] = dependencies
+                    return graph
+        except Exception as e:
+            print(f"Ошибка при загрузке тестового репозитория: {e}", file=sys.stderr)
+            return {}
+
+    def build_dependency_graph_bfs(self, start_package: str, max_depth: int, filter_str: str = None, 
+                             repo_url: str = None, repo_path: str = None, test_repo: bool = False) -> Dict[str, List[str]]:
+        """Строит граф зависимостей с помощью BFS"""
+        graph = {}
+        visited = set()
+        queue = deque()
+        
+        # Начинаем с корневого пакета
+        queue.append((start_package, 0))
+        visited.add(start_package)
+        
+        while queue:
+            current_package, depth = queue.popleft()
+            
+            print(f"Анализ пакета: {current_package} (глубина: {depth})")
+            
+            # Получаем зависимости текущего пакета
+            if test_repo and repo_path:
+                test_graph = self.load_test_repository(repo_path)
+                dependencies = test_graph.get(current_package, [])
+            else:
+                dependencies = self.get_direct_dependencies(current_package, repo_url, repo_path)
+            
+            # Применяем фильтр если задан
+            if filter_str:
+                dependencies = [dep for dep in dependencies if filter_str not in dep]
+            
+            graph[current_package] = dependencies
+            
+            # Добавляем зависимости в очередь только если не достигли максимальной глубины
+            # ИСПРАВЛЕНО: depth < max_depth вместо depth < max_depth - 1
+            if depth < max_depth:
+                for dep in dependencies:
+                    if dep not in visited:
+                        visited.add(dep)
+                        queue.append((dep, depth + 1))
+        
+        return graph
+
+    def detect_cycles(self, graph: Dict[str, List[str]]) -> List[List[str]]:
+        """Обнаруживает циклические зависимости в графе"""
+        cycles = []
+        visited = set()
+        recursion_stack = set()
+        path = []
+        
+        def dfs(node):
+            if node in recursion_stack:
+                # Найден цикл
+                cycle_start = path.index(node)
+                cycle = path[cycle_start:]
+                if cycle not in cycles:
+                    cycles.append(cycle.copy())
+                return
+            
+            if node in visited:
+                return
+            
+            visited.add(node)
+            recursion_stack.add(node)
+            path.append(node)
+            
+            for neighbor in graph.get(node, []):
+                if neighbor in graph:  # Проверяем только пакеты, которые есть в графе
+                    dfs(neighbor)
+            
+            path.pop()
+            recursion_stack.remove(node)
+        
+        for node in graph:
+            if node not in visited:
+                dfs(node)
+        
+        return cycles
+
+    def display_dependency_tree_ascii(self, graph: Dict[str, List[str]], start_package: str) -> None:
+        """Выводит дерево зависимостей в ASCII формате"""
+        print(f"\nДерево зависимостей для пакета '{start_package}':")
+        print("=" * 60)
+        
+        def print_tree(package, prefix="", is_last=True):
+            connector = "└── " if is_last else "├── "
+            print(prefix + connector + package)
+            
+            if package in graph:
+                dependencies = graph[package]
+                new_prefix = prefix + ("    " if is_last else "│   ")
+                
+                for i, dep in enumerate(dependencies):
+                    is_last_dep = i == len(dependencies) - 1
+                    print_tree(dep, new_prefix, is_last_dep)
+        
+        print_tree(start_package)
+
     def display_dependencies(self, package_name: str, dependencies: List[str]) -> None:
         """Выводит зависимости в читаемом формате"""
         print(f"\nПрямые зависимости пакета '{package_name}':")
@@ -254,7 +373,23 @@ class DependencyVisualizer:
             print(f"{i:2}. {dep}")
         
         print(f"\nВсего найдено зависимостей: {len(dependencies)}")
-    
+
+    def display_graph_statistics(self, graph: Dict[str, List[str]], cycles: List[List[str]]) -> None:
+        """Выводит статистику по графу зависимостей"""
+        print(f"\nСтатистика графа зависимостей:")
+        print("=" * 40)
+        print(f"Всего пакетов: {len(graph)}")
+        
+        total_dependencies = sum(len(deps) for deps in graph.values())
+        print(f"Всего зависимостей: {total_dependencies}")
+        
+        if cycles:
+            print(f"Обнаружено циклических зависимостей: {len(cycles)}")
+            for i, cycle in enumerate(cycles, 1):
+                print(f"  Цикл {i}: {' -> '.join(cycle)} -> {cycle[0]}")
+        else:
+            print("Циклические зависимости не обнаружены")
+
     def run(self) -> None:
         try:
             args = self.parse_arguments()
@@ -264,15 +399,29 @@ class DependencyVisualizer:
             
             print("\nСбор данных о зависимостях...")
             
-            # Получаем прямые зависимости
-            dependencies = self.get_direct_dependencies(
-                package_name=args['package'],
+            # Строим полный граф зависимостей с помощью BFS
+            dependency_graph = self.build_dependency_graph_bfs(
+                start_package=args['package'],
+                max_depth=args['max_depth'],
+                filter_str=args.get('filter'),
                 repo_url=args.get('repo_url'),
-                repo_path=args.get('repo_path')
+                repo_path=args.get('repo_path'),
+                test_repo=args.get('test_repo', False)
             )
             
-            # Выводим зависимости (требование этапа 2)
-            self.display_dependencies(args['package'], dependencies)
+            # Обнаруживаем циклические зависимости
+            cycles = self.detect_cycles(dependency_graph)
+            
+            # Выводим статистику графа
+            self.display_graph_statistics(dependency_graph, cycles)
+            
+            # Выводим дерево зависимостей если запрошено
+            if args.get('ascii_tree'):
+                self.display_dependency_tree_ascii(dependency_graph, args['package'])
+            else:
+                # Или просто показываем прямые зависимости корневого пакета
+                root_dependencies = dependency_graph.get(args['package'], [])
+                self.display_dependencies(args['package'], root_dependencies)
             
             print("\nАнализ зависимостей завершен")
             
@@ -286,7 +435,53 @@ class DependencyVisualizer:
             print(f"Неожиданная ошибка: {e}", file=sys.stderr)
             sys.exit(1)
 
+def create_test_repository_files():
+    """Создает тестовые файлы репозиториев для демонстрации"""
+    
+    # Тестовый репозиторий 1: Простой случай без циклов
+    simple_repo = {
+        "A": ["B", "C"],
+        "B": ["D", "E"],
+        "C": ["F"],
+        "D": [],
+        "E": ["F"],
+        "F": []
+    }
+    
+    with open('test_simple.json', 'w') as f:
+        json.dump(simple_repo, f, indent=2)
+    
+    # Тестовый репозиторий 2: С циклическими зависимостями
+    cyclic_repo = {
+        "A": ["B"],
+        "B": ["C"],
+        "C": ["A", "D"],  # Цикл A->B->C->A
+        "D": ["E"],
+        "E": ["C"]  # Цикл C->D->E->C
+    }
+    
+    with open('test_cyclic.json', 'w') as f:
+        json.dump(cyclic_repo, f, indent=2)
+    
+    # Тестовый репозиторий 3: Текстовый формат
+    with open('test_text.txt', 'w') as f:
+        f.write("X: Y, Z\n")
+        f.write("Y: P, Q\n")
+        f.write("Z: R\n")
+        f.write("P: \n")
+        f.write("Q: R\n")
+        f.write("R: \n")
+    
+    print("Созданы тестовые файлы репозиториев:")
+    print("  test_simple.json - простой граф без циклов")
+    print("  test_cyclic.json - граф с циклическими зависимостями")
+    print("  test_text.txt - текстовый формат графа")
+
 def main():
+    # Создаем тестовые файлы при первом запуске
+    if not os.path.exists('test_simple.json'):
+        create_test_repository_files()
+    
     visualizer = DependencyVisualizer()
     visualizer.run()
 
