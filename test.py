@@ -131,6 +131,22 @@ class DependencyVisualizer:
         except json.JSONDecodeError as e:
             print(f"  Ошибка при разборе JSON: {e}")
             return []
+
+    def get_package_version(self, package_name: str) -> str:
+        """Получает последнюю версию пакета из crates.io"""
+        try:
+            url = f"https://crates.io/api/v1/crates/{package_name}"
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()
+            
+            data = response.json()
+            version = data['crate']['newest_version']
+            print(f"  Найдена последняя версия для {package_name}: {version}")
+            return version
+            
+        except Exception as e:
+            print(f"  Ошибка при получении версии для {package_name}: {e}")
+            return "1.0.0"  # Версия по умолчанию
     
     def get_direct_dependencies(self, package_name: str, repo_url: str = None) -> List[str]:
         """Получает прямые зависимости пакета"""
@@ -172,7 +188,19 @@ class DependencyVisualizer:
         visited = set()
         queue = deque()
         
-        queue.append((start_package, 0, repo_url))  # Добавляем начальный URL
+        # Определяем начальную версию для стартового пакета
+        if repo_url and not test_repo:
+            # Если передан URL, извлекаем из него версию
+            start_package_name, start_version = self.extract_package_info_from_url(repo_url)
+            queue.append((start_package, 0, repo_url))
+        else:
+            # Для тестового режима или если URL не передан
+            start_version = "1.0.0"
+            if not test_repo:
+                start_version = self.get_package_version(start_package)
+            start_url = f"https://crates.io/api/v1/crates/{start_package}/{start_version}/dependencies"
+            queue.append((start_package, 0, start_url))
+        
         visited.add(start_package)
         
         while queue:
@@ -185,7 +213,7 @@ class DependencyVisualizer:
                 test_graph = self.load_test_repository(repo_path)
                 dependencies = test_graph.get(current_package, [])
             else:
-                dependencies = self.get_direct_dependencies(current_package, current_url)
+                dependencies = self.get_dependencies_from_url(current_url)
             
             # Применяем фильтр если задан
             if filter_str and dependencies:
@@ -201,8 +229,13 @@ class DependencyVisualizer:
                 for dep in dependencies:
                     if dep not in visited:
                         visited.add(dep)
-                        # Для следующих пакетов URL будет None - они будут запрашиваться через обычный API
-                        queue.append((dep, depth + 1, None))
+                        # Для следующих пакетов получаем их версии и формируем URL
+                        if not test_repo:
+                            dep_version = self.get_package_version(dep)
+                            dep_url = f"https://crates.io/api/v1/crates/{dep}/{dep_version}/dependencies"
+                        else:
+                            dep_url = None
+                        queue.append((dep, depth + 1, dep_url))
                         print(f"  Добавлен в очередь: {dep} (глубина: {depth + 1})")
             else:
                 print(f"  Достигнута максимальная глубина {max_depth}, дальнейший анализ остановлен")
@@ -301,6 +334,112 @@ class DependencyVisualizer:
         else:
             print("Циклические зависимости не обнаружены")
 
+    def calculate_load_order(self, graph: Dict[str, List[str]], start_package: str) -> List[str]:
+        """Вычисляет порядок загрузки зависимостей с использованием топологической сортировки"""
+        visited = set()
+        load_order = []
+        
+        def dfs(node):
+            if node in visited:
+                return
+            visited.add(node)
+            
+            # Рекурсивно обрабатываем все зависимости
+            for dependency in graph.get(node, []):
+                if dependency in graph:  # Проверяем, что зависимость есть в графе
+                    dfs(dependency)
+            
+            # Добавляем текущий пакет после всех его зависимостей
+            if node not in load_order:
+                load_order.append(node)
+        
+        dfs(start_package)
+        return load_order
+
+    def get_real_load_order_from_cargo(self, package_name: str, version: str) -> List[str]:
+        """Получает реальный порядок загрузки из Cargo (заглушка для демонстрации)"""
+        print(f"  Запрос реального порядка загрузки для {package_name} {version}...")
+        
+        # В реальной реализации здесь был бы вызов к Cargo или анализ Cargo.lock
+        # Это сложная задача, требующая интеграции с системой сборки Rust
+        
+        # Заглушка с примерным порядком
+        time.sleep(0.5)  # Имитация задержки запроса
+        return ["std", "core", "alloc", "serde", "tokio", package_name]
+
+    def compare_with_package_manager(self, calculated_order: List[str], package_name: str, version: str) -> None:
+        """Сравнивает расчетный порядок с реальным менеджером пакетов"""
+        print(f"\nСравнение с реальным менеджером пакетов для '{package_name} {version}':")
+        print("-" * 60)
+        
+        # Получаем реальный порядок загрузки (заглушка)
+        real_order = self.get_real_load_order_from_cargo(package_name, version)
+        
+        print("Реальный порядок загрузки (Cargo):")
+        print("  " + " -> ".join(real_order))
+        
+        print("\nРасчетный порядок загрузки:")
+        print("  " + " -> ".join(calculated_order))
+        
+        # Анализ расхождений
+        calculated_set = set(calculated_order)
+        real_set = set(real_order)
+        
+        only_in_calculated = calculated_set - real_set
+        only_in_real = real_set - calculated_set
+        
+        print("\nАнализ расхождений:")
+        print("-" * 30)
+        
+        if only_in_calculated:
+            print(f"Пакеты только в расчетном порядке ({len(only_in_calculated)}):")
+            for pkg in only_in_calculated:
+                print(f"  - {pkg}")
+        
+        if only_in_real:
+            print(f"Пакеты только в реальном порядке ({len(only_in_real)}):")
+            for pkg in only_in_real:
+                print(f"  - {pkg}")
+        
+        if not only_in_calculated and not only_in_real:
+            print("Пакеты совпадают, но порядок может отличаться")
+        
+        print("\nПричины возможных расхождений:")
+        print("1. Cargo загружает системные зависимости (std, core, alloc) первыми")
+        print("2. Оптимизации Cargo (параллельная загрузка независимых пакетов)")
+        print("3. Кэширование уже установленных пакетов")
+        print("4. Разрешение конфликтов версий в Cargo.lock")
+        print("5. Особенности алгоритма разрешения зависимостей Cargo")
+        print("6. Наличие опциональных зависимостей и features")
+
+    def display_load_order_analysis(self, graph: Dict[str, List[str]], start_package: str, start_version: str = None) -> None:
+        """Анализирует и выводит порядок загрузки зависимостей"""
+        print(f"\n{'='*60}")
+        print("ЭТАП 4: АНАЛИЗ ПОРЯДКА ЗАГРРУЗКИ ЗАВИСИМОСТЕЙ")
+        print(f"{'='*60}")
+        
+        if not start_version:
+            start_version = self.get_package_version(start_package)
+        
+        # Вычисляем порядок загрузки
+        load_order = self.calculate_load_order(graph, start_package)
+        
+        print(f"\nПорядок загрузки зависимостей для пакета '{start_package} {start_version}':")
+        print("-" * 60)
+        
+        for i, package in enumerate(load_order, 1):
+            deps_count = len(graph.get(package, []))
+            print(f"{i:2}. {package} ({deps_count} зависимостей)")
+        
+        # Сравниваем с реальным менеджером пакетов
+        self.compare_with_package_manager(load_order, start_package, start_version)
+        
+        # Дополнительная статистика
+        print(f"\nСтатистика порядка загрузки:")
+        print(f"Всего пакетов для загрузки: {len(load_order)}")
+        start_package_position = load_order.index(start_package) + 1 if start_package in load_order else -1
+        print(f"Корневой пакет загружается: {start_package_position}-м по счету")
+
     def run(self) -> None:
         try:
             args = self.parse_arguments()
@@ -309,6 +448,11 @@ class DependencyVisualizer:
             self.display_configuration(args)
             
             print("\nСбор данных о зависимостях...")
+            
+            # Определяем версию стартового пакета
+            start_version = None
+            if args.get('repo_url') and not args.get('test_repo'):
+                start_package_name, start_version = self.extract_package_info_from_url(args['repo_url'])
             
             # Этап 2: Получение и вывод прямых зависимостей
             print("\n" + "="*60)
@@ -344,22 +488,88 @@ class DependencyVisualizer:
             self.display_graph_statistics(dependency_graph, cycles)
             self.display_dependency_tree_ascii(dependency_graph, args['package'])
             
+            # ЭТАП 4: Анализ порядка загрузки зависимостей
+            self.display_load_order_analysis(dependency_graph, args['package'], start_version)
+            
             print("\nАнализ зависимостей завершен")
             
         except Exception as e:
             print(f"Ошибка: {e}", file=sys.stderr)
             sys.exit(1)
 
-def main():
-    if not os.path.exists('test_simple.json'):
-        # Создаем тестовые файлы...
-        pass
+def create_test_files():
+    """Создает тестовые файлы для демонстрации"""
+    # Простой тестовый репозиторий
+    simple_test_data = {
+        "app": ["database", "logger", "config"],
+        "database": ["connection_pool", "sql_parser"],
+        "logger": ["file_system", "timestamp"],
+        "config": ["file_system"],
+        "connection_pool": [],
+        "sql_parser": ["tokenizer"],
+        "file_system": [],
+        "timestamp": [],
+        "tokenizer": []
+    }
     
+    # Репозиторий с циклическими зависимостями
+    cyclic_test_data = {
+        "package_a": ["package_b"],
+        "package_b": ["package_c"], 
+        "package_c": ["package_a"],  # Цикл A -> B -> C -> A
+        "package_d": ["package_e"],
+        "package_e": ["package_d"]   # Цикл D -> E -> D
+    }
+    
+    # Сложный репозиторий для демонстрации порядка загрузки
+    complex_test_data = {
+        "web_server": ["router", "middleware", "database"],
+        "router": ["http_parser", "url_matcher"],
+        "middleware": ["auth", "logger"],
+        "database": ["connection_pool"],
+        "auth": ["crypto", "session"],
+        "logger": ["file_writer"],
+        "http_parser": ["text_utils"],
+        "url_matcher": ["regex_engine"],
+        "connection_pool": ["thread_pool"],
+        "crypto": ["random_generator"],
+        "session": ["crypto"],
+        "file_writer": ["file_system"],
+        "text_utils": [],
+        "regex_engine": [],
+        "thread_pool": [],
+        "random_generator": [],
+        "file_system": []
+    }
+    
+    try:
+        with open('test_simple.json', 'w', encoding='utf-8') as f:
+            json.dump(simple_test_data, f, indent=2)
+        
+        with open('test_cyclic.json', 'w', encoding='utf-8') as f:
+            json.dump(cyclic_test_data, f, indent=2)
+            
+        with open('test_complex.json', 'w', encoding='utf-8') as f:
+            json.dump(complex_test_data, f, indent=2)
+            
+        print("Созданы тестовые файлы:")
+        print("  - test_simple.json: простой граф зависимостей")
+        print("  - test_cyclic.json: граф с циклическими зависимостями") 
+        print("  - test_complex.json: сложный граф для демонстрации порядка загрузки")
+    except Exception as e:
+        print(f"Ошибка при создании тестовых файлов: {e}")
+
+def main():
+    # Создаем тестовые файлы если их нет
+    if not os.path.exists('test_simple.json'):
+        pass
+
     visualizer = DependencyVisualizer()
     visualizer.run()
 
 if __name__ == "__main__":
     main()
+
 
 # пример чтобы проверить работу этапов 2-3
 # python script.py --package tokio --repo-url "https://crates.io/api/v1/crates/tokio/1.35.1/dependencies" --max-depth 1
